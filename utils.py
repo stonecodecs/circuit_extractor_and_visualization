@@ -21,13 +21,17 @@ IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 ###############################################################################
 
-def normalize(img, to_shape=(299, 299)):
-    transforms = T.Compose([
-        T.Resize((299,299)),
+def normalize(img, change_to_shape=None):
+    ts = [
         T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)]
-    )
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    ]
 
+    if change_to_shape is not None:
+        ts.insert(0, T.Resize(change_to_shape))
+    
+
+    transforms = T.Compose(ts)
     return transforms(img)
 
 

@@ -11,6 +11,8 @@ import utils
 import sys
 import heapq
 
+import time
+from functools import wraps
 
 # Dataset to use with ImageNet
 # TODO: Retrieve files to __get_item__ rather than store all at once (runs out of memory)
@@ -226,6 +228,7 @@ class CircuitExtractor():
         # circuit[L] initialization
         # _, topk_n_neurons = self.topk_attribution_scores_online(self.end - 1, self.end)
         _, topk_n = self.get_topk_neurons(self.end - 1, self.end, max_dim='init')
+        torch.cuda.empty_cache()
         self.circuit[self._nameof(end)] = topk_n.clone().detach()
 
         # backwards pass
@@ -261,7 +264,6 @@ class CircuitExtractor():
                 
         print("FINAL CIRCUIT: ", self.circuit, "\nPREVIOUS: ", prev_circuit)
 
-
     def backward_pass(self):
         """ Runs through a backward pass of the CLA algorithm. """
         if not hasattr(self, 'start') or not hasattr(self, 'end') or not hasattr(self, 'circuit'):
@@ -269,10 +271,11 @@ class CircuitExtractor():
                          "Cannot run a backwards pass until running 'build_circuit'.")
         
         for i in range(self.end - 1, self.start - 1, -1): # L - 1 to start
-            _, topk_m = self.get_topk_neurons(i, i + 1, max_dim='m')
+            print("backward", i)
+            _, topk_m = self.get_topk_neurons(i, i + 1, max_dim='m')            
+            torch.cuda.empty_cache()
             self.circuit[self._nameof(i)] = topk_m.clone().detach()
 
-    
     def forward_pass(self):
         """ Runs through a forward pass of the CLA algorithm. """
         if not hasattr(self, 'start') or not hasattr(self, 'end') or not hasattr(self, 'circuit'):
@@ -280,10 +283,11 @@ class CircuitExtractor():
                          "Cannot run forward pass until running 'build_circuit'.")
 
         for i in range(self.start + 1, self.end + 1):
+            print("forward", i)
             _, topk_n = self.get_topk_neurons(i - 1, i, max_dim='n')
+            torch.cuda.empty_cache()
             self.circuit[self._nameof(i)] = topk_n.clone().detach()
     
-
     def get_topk_neurons(self, l1, l2, max_dim) -> Tuple[Tuple[float], Tuple[int]]:
         """
         Get the topk 'm' or 'n' neurons of an attribution matrix.
@@ -316,20 +320,25 @@ class CircuitExtractor():
         num_chunks, l1_size, l2_size = self._compute_chunk_size(
             l1, l2,  # these layers are ALWAYS in chronological order
             limit=torch.cuda.mem_get_info(0)[0], # all GPU memory available in gpu:0 [assuming 1 GPU]
-            overhead=(max_dim != 'init')   # saves GPU memory for the 'sum_stack' tensor if true
+            max_dim=max_dim
         )
+
+        print("memcheck", torch.cuda.mem_get_info()[0])
 
         print(f"l1size: {l1_size}, l2size: {l2_size}")
 
         chunk_size = ceil(l2_size / num_chunks) # size (of floats) per chunk
         buffer = torch.zeros((chunk_size, l1_size), device=self.device) # holds 1 chunk of attribution scores
 
+        print(f"chunk_size: {chunk_size} x{num_chunks}")
+        print(buffer.shape)
+
         topk_neurons = [] # list of neurons for circuit
         chunk_sums = None  # if max_dim == 'init'
         chunk_idx = 0 # for chunk_sums and chunk_topk (below)
 
         # if not 'init', then we're summing over a dimension of the attribution matrix
-        if max_dim in {'n', 'm'}:
+        if max_dim in {'n', 'm'}: 
             chunk_sums = torch.zeros(
                 (num_chunks, l1_size if max_dim == 'm' else chunk_size),
                 device=self.device
@@ -337,6 +346,7 @@ class CircuitExtractor():
 
         # start processing chunks of the Jacobian => attribution matrix
         for i in range(num_chunks):
+            print("chunk#", i)
             buffer.zero_() # clear buffer every chunk
             idx_slice = slice(
                 i * chunk_size,
@@ -383,6 +393,7 @@ class CircuitExtractor():
 
     def compute_attribution_score_chunk(self, l1, l2, max_dim, buffer, idx_slice, chunk_size, layer_size, next_size):
         N = self.input.size(0)
+
         if max_dim == 'm':
             # if 'm', selects the 'm' neurons that maximize the summed attrbution score of topk 'n' neurons
             selected_neurons = self.circuit[self._nameof(l2)]
@@ -419,7 +430,7 @@ class CircuitExtractor():
             # add the averaged sum to the buffer incrementally, then convert into attribution matrix
             if partial_J.size(0) == chunk_size:
                 attr = partial_J.view(chunk_size, layer_size) * torch.abs(l1_act.view(-1))
-                buffer += attr.detach() / N
+                buffer = attr.detach() / N
             else:
                 attr = partial_J.view(partial_J.size(0), layer_size) * torch.abs(l1_act.view(-1))
                 buffer[0:partial_J.size(0)] += attr.detach() / N
@@ -427,159 +438,6 @@ class CircuitExtractor():
             del partial_J, attr
 
         return buffer
-
-    def topk_attribution_scores_online(self,
-        layer, next_layer, select_neurons=None, summed=False) -> Tuple[Tuple[float], Tuple[int]]:
-        """
-        More memory-efficient way of getting the Jacobian terms using VJP.
-        Ran for a chunk of neurons 'n' each, w.r.t all 'm' of the current layer's activation.
-        (Chunk is how many JVPs the GPU can run in parallel.)
-        NOTE: If you want to forward pass, switch layer and next_layer parameter order.
-
-        Args:
-            layer_act (int): Index of current layer 'i'.
-            next_act (int): Index of next layer 'i+1'.
-            select_neurons (torch.Tensor[int]): Neurons 'n' to include from next_act; if None, uses all 'n'.
-            sum_axis(str): Take topk SUMS of attributions for neuron 'n' or 'm'.
-            (Meaning, we want the reduction axis to be the OTHER axis). 'none' (no sum) by default.
-
-        Returns:
-            Tuple, Tuple: Top-k neurons to be involved in the circuit for the current layer.
-                First return value is a tuple of attribution values, 2nd value is their ordered indices 
-                with regards to their flattened Jacobian matrix (next_size, layer_size).
-        """
-        if not hasattr(self, 'k'):
-            RuntimeError("build_circuit hasn't been called with parameter 'k' yet. \
-                         Cannot compute circuit neurons for the current layer.")
-        print("\nRUNNING with k:", self.k)
-
-        is_forward = layer > next_layer  # bool to modify logic for forward pass
-
-        # For online computation: need to see how much memory we're working with
-        # to adapt the algorithm to run without going above that limit.
-        N = self.input.size(0)
-        num_chunks, layer_size, next_size = self._compute_chunk_size(
-            layer, next_layer,
-            limit=torch.cuda.mem_get_info(0)[0],
-            select_neurons=select_neurons,
-            overhead=summed   # if true, saves GPU memory for the 'sum_stack' tensor
-        ) # limit='all memory possible on GPU(0)'
-
-        if select_neurons is not None:
-            # make sure that next_size reflects the new # of 'n' neurons to process
-            # but ALSO preserve the same shape
-            sel_size = len(select_neurons)
-                
-
-        if summed:
-            # to store sum of buffer for multiple chunks
-            sum_stack = torch.zeros(
-                (num_chunks, layer_size),
-                device=self.device)            
-            # increment during chunk summing
-            sum_stack_idx = 0
-
-        # print("meta", N, num_chunks)
-        print("thislayersize 'm'", layer_size) # expect 36
-        print("nextlayersize 'n'", next_size, f" (selected: {sel_size if summed else 0})") # expect 108
-        topk_neurons = [] # Each element being (value, idx [as flattened]); treat as our min-heap
-
-        # for chunk size, could also do limit / sizeof(dtype), then on the last chunk, do the remaining
-        # doing this for simplicity right now
-        chunk_size = ceil(next_size if not summed else sel_size / num_chunks) # size (of floats) per chunk
-        print('for layers:', self._nameof(layer), self._nameof(next_layer))
-        print('chunksize', chunk_size, ' x', num_chunks) # expect 108 chunks of 1 (1 x108)
-        # buffer is (chunks of 'n') for all 'm' in previous layer
-        buffer = torch.zeros((chunk_size, layer_size), device=self.device)
-
-        # one chunk is # of rows to take of the Jacobian on each iteration (idx_slice)
-        for i in range(num_chunks):
-            print(f"processing chunk {i + 1}/{num_chunks}: \n")
-            buffer.zero_() # clear buffer every chunk
-
-            idx_slice = slice(
-                i * chunk_size,
-                (i+1) * chunk_size if i < num_chunks - 1 else next_size if select_neurons is None else sel_size
-            )
-
-            if select_neurons is None:
-                rows = get_identity_subset(next_size, idx_slice.start, idx_slice.stop).to(self.device) # chunked(n) x m sized
-            else:
-                # divide by next_size to get index of the n-th neuron from the flattened jacobian index
-                rows = get_identity_subset(layer_size if is_forward else next_size, select_neurons).to(self.device)
-                print("selected neurons 'n':", select_neurons)
-                # NOTE: probably a bug when selected_neurons is more than a single chunk is able to handle.
-                #       However, this should never happen as long as 'k' is not astronomically large.
-
-            # for each instance in the input distribution, get average of the gradients w.r.t each 'layer' neuron.
-            for inst in range(N):
-                activations = self._get_activations(layer, next_layer, inst=inst)
-                layer_act = activations[self._nameof(layer)]
-                next_act = activations[self._nameof(next_layer)] # MISNOMER if is_forward=True (then, actually goes BEFORE)
-
-                def get_grad_for_neuron(n):
-                    return torch.autograd.grad(
-                        next_act.view(1, -1) if not is_forward else layer_act.view(1, -1),
-                        layer_act if not is_forward else next_act,
-                        n.unsqueeze(0),
-                        retain_graph=True if inst < N - 1 else False)[0]
-
-                partial_J = torch.vmap(get_grad_for_neuron)(rows)
-                print("J", partial_J.shape)
-                # for forward pass, we want 108 x 5, but we get (4,3,3)=36 x 5 instead
-                # so for forward, we need to instead find all (36=5)x108 J
-
-                # add the averaged sum to the buffer incrementally
-                if partial_J.size(0) == chunk_size:
-                    l2grad = ((partial_J.view(chunk_size, layer_size)) ** 2) ** 0.5 # l2 norm of each neuron
-                    attr = l2grad * torch.abs(layer_act.view(-1) if next_layer > layer else next_act.view(-1))
-                    buffer += attr.detach() / N
-
-                else:
-                    l2grad = ((partial_J.view(partial_J.size(0), layer_size)) ** 2) ** 0.5
-                    attr = l2grad * torch.abs(layer_act.view(-1) if next_layer > layer else next_act.view(-1))
-                    buffer[0:partial_J.size(0)] += attr.detach() / N
-                
-                del partial_J, l2grad, attr
-
-            # kidx is int, must divide by layer_size to see what neuron 'n' it is referring to, and
-            # then also % layer_size to see the intermediate variable 'm' that maximizes it.
-            if summed:
-                # when summing, use different tools: need to add up ALL 'm'
-                # therefore we need to preserve the sums through ALL chunks
-                sum_stack[sum_stack_idx] = buffer.sum(dim=0).detach()
-                sum_stack_idx += 1
-            else:
-                kval, kidx = buffer.max(dim=1)[0].topk(self.k)
-                kidx = kidx + (i * chunk_size) # update labels globally (beyond the indices of the chunk)
-                print(f"kval: {kval.data}\nkidx: {kidx.data}")
-
-                # to save space, we update *globally* the top k for each chunk (after iterating through input dist.)
-                # we do this by using a min-heap (eventually stores topk for the entire Jacobian => all circuit neurons)
-                for k, val in enumerate(kval):
-                    if len(topk_neurons) < self.k:
-                        heapq.heappush(topk_neurons, (val.detach(), kidx[k].detach()))
-                    elif val > topk_neurons[0][0]:  # If the current number is larger than the smallest in the heap
-                        # Replace the smallest element with the current number
-                        heapq.heapreplace(topk_neurons, (val.detach(), kidx[k].detach()))
-
-            print(f"finished chunk {i + 1}/{num_chunks}!")
-
-        if summed: 
-            # after all chunks computed, sum the buffer sums to get the global attribution score
-            print("SUMMED BUFFER SHAPE", sum_stack.shape)
-            sum_stack = sum_stack.sum(dim=0) # shape (layer_size(m),)
-            kval, kidx = sum_stack.topk(self.k)
-            topk_neurons = [(kval[k].detach(), kidx[k].detach()) for k in range(len(kval))]
-            print("summed result:", topk_neurons)
-            del sum_stack
-
-        del buffer, rows
-
-        # final topk (m,n) neuron connections become the chosen neurons
-        # returns (values), (indices)
-        final_val, final_idx = zip(*sorted(topk_neurons, reverse=True, key=lambda k: k[0]))
-        return torch.tensor(final_val, device=self.device), torch.tensor(final_idx, device=self.device)
     
 
     def get_attribution_scores(self, start=None, end=None):
@@ -621,7 +479,7 @@ class CircuitExtractor():
 
                 def layer_func(x):
                     # get the l2 norm of each neuron activation (scalar; equivalent to absolute value)
-                    next_out = ((self._get_layer(layer_idx + 1)(x)).squeeze(0) ** 2) ** 0.5 # l2 norm
+                    next_out = (self._get_layer(layer_idx + 1)(x)).squeeze(0).pow(2).sqrt() # l2 norm
                     return next_out
 
                 # J shape: (Cj, Hj, Wj, Ci, Hi, Wi)
@@ -689,7 +547,7 @@ class CircuitExtractor():
         layer1: int,
         layer2: int,
         limit: int,
-        overhead: bool = False,
+        max_dim: str,
     ) -> int:
         """
         Helper function for Circuit Extractor; calculating how much memory a Jacobian computation would use,
@@ -713,9 +571,12 @@ class CircuitExtractor():
         L1 = bytes_dict[self._nameof(layer1)] # neurons 'm'
         L2 = bytes_dict[self._nameof(layer2)] # neurons 'n'
 
-        if overhead:
-            # basically, num_chunks * L1 (using limit BEFORE defining the new, reduced limit)
-            limit -= ceil((L2 // self.input.element_size()) / floor(limit / L1)) * L1
+        if max_dim == 'm':
+            # easier since we only need to compute 'self.k' 'n' neurons w.r.t 'm'
+            limit = floor(limit * 0.95)
+        else:
+            # could be a better way, but need to half to create 'rows' for vectorized vJP
+            limit = floor(limit * 0.48)
 
         # if not enough bytes for a single row of 'm' neurons per 'n' (assuming backward, but works both ways)
         if L1 > limit:
@@ -724,6 +585,7 @@ class CircuitExtractor():
                                f"\nBytes available: {limit}, bytes requested: {L1}")
         
         chunk_size = floor(limit / L1) # how many rows of 'n' can be computed at once
+        print("MAX CHUNK SIZE:", chunk_size)
 
         # convert to num floats (// 4)
         L1 = L1 // self.input.element_size()
